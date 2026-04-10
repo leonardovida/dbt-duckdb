@@ -61,7 +61,7 @@ CREATE DATABASE my_ducklake
   (TYPE ducklake, DATA_PATH 's3://...')
 ```
 
-An example profile is show below under "Attaching Additional Databases". DuckLake must be identified so that safe DDL operations are applied by dbt.
+An example profile is shown below under "Attaching Additional Databases". DuckLake must be identified so dbt can apply the safe DDL path for DuckLake relations.
 
 #### DuckDB Extensions, Settings, and Filesystems
 
@@ -544,6 +544,29 @@ select
   date_trunc('hour', event_time) as event_hour
 from {{ ref('upstream_model') }}
 ```
+
+#### DuckLake Table Sorting
+
+For DuckLake-backed SQL models, you can also configure physical write ordering with `sorted_by`:
+
+```sql
+{{ config(
+    materialized='table',
+    partitioned_by=['event_day'],
+    sorted_by=['event_time ASC', 'event_type DESC NULLS FIRST']
+) }}
+
+select
+  *,
+  date_trunc('day', event_time) as event_day
+from {{ ref('upstream_model') }}
+```
+
+`sorted_by` accepts DuckLake `SET SORTED BY` expressions such as `event_time ASC` or `event_type DESC NULLS FIRST`.
+
+This setting is only applied for DuckLake relations. On local DuckLake, `sorted_by` requires DuckDB >= `1.5.1`. On MotherDuck-managed DuckLake, it is available with the hosted DuckLake runtime.
+
+dbt-duckdb applies `sorted_by` before initial and full-refresh inserts so the first load is ordered, and orders incremental append and delete+insert writes to match the configured sort path. Use an empty string or empty list to emit `RESET SORTED BY`.
 
 
 **Merge Strategy (DuckDB >= 1.4.0):**

@@ -241,24 +241,32 @@ class DuckDBCredentials(Credentials):
 
         # Build set of ducklake database names for efficient lookup
         self._ducklake_dbs = set()
+        self._motherduck_dbs = set()
 
         if self.is_ducklake or "ducklake:" in self.path.lower():
             self._ducklake_dbs.add(self.path_derived_database_name(self.path))
+
+        if self._is_motherduck(urlparse(self.path).scheme):
+            self._motherduck_dbs.add(self.path_derived_database_name(self.path))
 
         if self.attach:
             for attachment in self.attach:
                 is_ducklake_flag = getattr(attachment, "is_ducklake", None)
                 path = getattr(attachment, "path", None)
                 alias = getattr(attachment, "alias", None)
+                database_name = alias or (
+                    self.path_derived_database_name(path) if isinstance(path, str) else None
+                )
 
                 # Detect ducklake by explicit type, or by path scheme. Be lenient on case.
                 if (isinstance(is_ducklake_flag, bool) and is_ducklake_flag) or (
                     isinstance(path, str) and "ducklake:" in path.lower()
                 ):
-                    if alias:
-                        self._ducklake_dbs.add(alias)
-                    else:
-                        self._ducklake_dbs.add(self.path_derived_database_name(path))
+                    if database_name:
+                        self._ducklake_dbs.add(database_name)
+
+                if database_name and isinstance(path, str) and self._is_motherduck(urlparse(path).scheme):
+                    self._motherduck_dbs.add(database_name)
 
         # Add MotherDuck plugin if the path is a MotherDuck database
         # and plugin was not specified in profile.yml

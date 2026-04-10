@@ -1,6 +1,7 @@
 {% macro duckdb__get_delete_insert_merge_sql(target, source, unique_key, dest_columns, incremental_predicates) -%}
 
     {%- set dest_cols_csv = get_quoted_csv(dest_columns | map(attribute="name")) -%}
+    {%- set order_by_sql = ducklake_sorted_order_by_sql(target) -%}
 
     {% if unique_key %}
         {% if unique_key is sequence and unique_key is not string %}
@@ -37,6 +38,9 @@
     (
         select {{ dest_cols_csv }}
         from {{ source }}
+        {% if order_by_sql %}
+          order by {{ order_by_sql }}
+        {% endif %}
     )
 
 {%- endmacro %}

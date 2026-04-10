@@ -57,6 +57,106 @@
   )
 {% endmacro %}
 
+{% macro duckdb__has_sorted_by_config() -%}
+  {% set absent = '__dbt_ducklake_absent__' %}
+  {{ return(config.get('sorted_by', absent) != absent) }}
+{% endmacro %}
+
+{% macro duckdb__get_sorted_by_statement(relation, temporary) -%}
+  {%- if temporary or not duckdb__has_sorted_by_config() -%}
+    {{ return(none) }}
+  {%- endif -%}
+
+  {%- if not adapter.is_ducklake(relation) -%}
+    {% do adapter.warn_once(
+      "sorted_by is only supported for DuckLake relations; ignoring for "
+      ~ relation
+    ) %}
+    {{ return(none) }}
+  {%- endif -%}
+
+  {{ return(adapter.ducklake_table_option_sql(relation, 'sorted_by', config.get('sorted_by'))) }}
+{% endmacro %}
+
+{% macro duckdb__get_sorted_by(relation, temporary) -%}
+  {% set sorted_by_statement = duckdb__get_sorted_by_statement(relation, temporary) %}
+  {% if sorted_by_statement is none %}
+    {{ return(none) }}
+  {% endif %}
+
+  {{ return(adapter.ducklake_order_by_sql(config.get('sorted_by'))) }}
+{% endmacro %}
+
+{% macro ducklake_sorted_order_by_sql(relation) -%}
+  {{ return(duckdb__get_sorted_by(relation, false)) }}
+{% endmacro %}
+
+{% macro ducklake_flush_relation(relation) -%}
+  {% if adapter.is_ducklake(relation) and duckdb__has_sorted_by_config() %}
+    {% set catalog_name = relation.database | replace("'", "''") %}
+    {% set table_name = relation.identifier | replace("'", "''") %}
+    {% set schema_name = relation.schema | replace("'", "''") %}
+    {% call statement('ducklake_flush_' ~ relation.identifier, auto_begin=False) -%}
+      call ducklake_flush_inlined_data('{{ catalog_name }}', table_name => '{{ table_name }}', schema_name => '{{ schema_name }}')
+    {%- endcall %}
+  {% endif %}
+{% endmacro %}
+
+{% macro create_empty_table_as(temporary, relation, compiled_code, language='sql') -%}
+  {{ return(adapter.dispatch('create_empty_table_as', 'duckdb')(temporary, relation, compiled_code, language)) }}
+{% endmacro %}
+
+{% macro duckdb__create_empty_table_as(temporary, relation, compiled_code, language='sql') -%}
+  {%- if language != 'sql' -%}
+      -- DuckLake sorted table options are applied via separate DDL/INSERT statements below, and that split path is only wired for SQL models.
+      {% do exceptions.raise_compiler_error("DuckLake `sorted_by` is currently supported only for SQL models") %}
+  {%- endif -%}
+
+  {% set contract_config = config.get('contract') %}
+  {%- set sql_header = config.get('sql_header', none) -%}
+
+  {{ sql_header if sql_header is not none }}
+
+  create {% if temporary: -%}temporary{%- endif %} table
+    {{ relation.include(database=(not temporary), schema=(not temporary)) }}
+  {% if contract_config.enforced and not temporary %}
+    {{ get_table_columns_and_constraints() }};
+  {% else %}
+    as (
+      select * from (
+        {{ compiled_code }}
+      ) as __dbt_ducklake_empty where 1 = 0
+    );
+  {% endif %}
+{% endmacro %}
+
+{% macro insert_into_table(relation, compiled_code, language='sql') -%}
+  {{ return(adapter.dispatch('insert_into_table', 'duckdb')(relation, compiled_code, language)) }}
+{% endmacro %}
+
+{% macro duckdb__insert_into_table(relation, compiled_code, language='sql') -%}
+  {%- if language != 'sql' -%}
+      -- Python models still materialize through create_table_as; this insert-based path only handles SQL compiled_code.
+      {% do exceptions.raise_compiler_error("DuckLake `sorted_by` is currently supported only for SQL models") %}
+  {%- endif -%}
+
+  {% set contract_config = config.get('contract') %}
+  {% set order_by_sql = ducklake_sorted_order_by_sql(relation) %}
+
+  insert into {{ relation }}
+  {% if contract_config.enforced %}
+    {{ get_column_names() }}
+  {% endif %}
+  (
+    select * from (
+      {{ compiled_code }}
+    ) as __dbt_ducklake_insert_source
+    {% if order_by_sql %}
+      order by {{ order_by_sql }}
+    {% endif %}
+  );
+{% endmacro %}
+
 
 {% macro duckdb__get_partitioned_by(relation, temporary) -%}
   {%- if temporary -%}
@@ -191,6 +291,22 @@ def materialize(df, con):
   create view {{ relation }} as (
     {{ sql }}
   );
+{% endmacro %}
+
+{% macro duckdb__get_insert_into_sql(target_relation, temp_relation, dest_columns) %}
+
+    {%- set dest_cols_csv = get_quoted_csv(dest_columns | map(attribute="name")) -%}
+    {%- set order_by_sql = ducklake_sorted_order_by_sql(target_relation) -%}
+
+    insert into {{ target_relation }} ({{ dest_cols_csv }})
+    (
+        select {{ dest_cols_csv }}
+        from {{ temp_relation }}
+        {% if order_by_sql %}
+          order by {{ order_by_sql }}
+        {% endif %}
+    )
+
 {% endmacro %}
 
 {% macro duckdb__get_columns_in_relation(relation) -%}

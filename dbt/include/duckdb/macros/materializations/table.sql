@@ -29,12 +29,36 @@
   -- `BEGIN` happens here:
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
   {%- set partitioned_by = duckdb__get_partitioned_by(target_relation, false) -%}
+  {%- set sorted_by = duckdb__get_sorted_by(target_relation, false) -%}
   {%- set skip_auto_begin = partitioned_by and adapter.is_ducklake(target_relation) -%}
 
   -- build model
-  {% call statement('main', language=language, auto_begin=not skip_auto_begin) -%}
-    {{- create_table_as(False, intermediate_relation, compiled_code, language, partitioned_by=partitioned_by) }}
-  {%- endcall %}
+  {% if sorted_by %}
+    {% if language != 'sql' %}
+      {% do exceptions.raise_compiler_error("DuckLake `sorted_by` is currently supported only for SQL models") %}
+    {% endif %}
+    {% call statement('main', language=language) -%}
+      {{- create_empty_table_as(False, intermediate_relation, compiled_code, language) }}
+    {%- endcall %}
+    {% if partitioned_by %}
+      {% call statement('ducklake_partitioned_by') -%}
+        {{ duckdb__alter_table_set_partitioned_by(intermediate_relation, partitioned_by) }}
+      {%- endcall %}
+    {% endif %}
+    {% set sorted_by_statement = duckdb__get_sorted_by_statement(intermediate_relation, false) %}
+    {% if sorted_by_statement %}
+      {% call statement('ducklake_sorted_by') -%}
+        {{ sorted_by_statement }};
+      {%- endcall %}
+    {% endif %}
+    {% call statement('main_insert', language=language) -%}
+      {{- insert_into_table(intermediate_relation, compiled_code, language) }}
+    {%- endcall %}
+  {% else %}
+    {% call statement('main', language=language, auto_begin=not skip_auto_begin) -%}
+      {{- create_table_as(False, intermediate_relation, compiled_code, language, partitioned_by=partitioned_by) }}
+    {%- endcall %}
+  {% endif %}
 
   -- cleanup
   {% if existing_relation is not none %}
@@ -57,6 +81,10 @@
 
   -- `COMMIT` happens here
   {{ adapter.commit() }}
+
+  {% if sorted_by %}
+    {% do ducklake_flush_relation(target_relation) %}
+  {% endif %}
 
   {% if post_commit_ducklake_docs %}
     {% do persist_docs(target_relation, model) %}

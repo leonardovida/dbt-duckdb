@@ -20,6 +20,11 @@
   {%- if existing_relation is none or full_refresh_mode -%}
     {%- set partitioned_by = duckdb__get_partitioned_by(target_relation, false) -%}
   {%- endif -%}
+  {%- set sorted_by = duckdb__get_sorted_by(target_relation, false) -%}
+  {%- set sorted_by_statement = none -%}
+  {%- if sorted_by or (duckdb__has_sorted_by_config() and adapter.is_ducklake(target_relation)) -%}
+    {%- set sorted_by_statement = duckdb__get_sorted_by_statement(target_relation, false) -%}
+  {%- endif -%}
   {%- set skip_auto_begin = partitioned_by and adapter.is_ducklake(target_relation) -%}
 
   -- the temp_ and backup_ relations should not already exist in the database; get_relation
@@ -55,12 +60,31 @@
   -- `BEGIN` happens here:
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
+  {% if sorted_by and language != 'sql' and (existing_relation is none or full_refresh_mode) %}
+    {% do exceptions.raise_compiler_error("DuckLake `sorted_by` is currently supported only for SQL models during initial and full-refresh builds") %}
+  {% endif %}
+
   {% if existing_relation is none %}
-    {% set build_sql = create_table_as(False, target_relation, compiled_code, language, partitioned_by=partitioned_by) %}
+    {% if sorted_by %}
+      {% set build_sql = create_empty_table_as(False, target_relation, compiled_code, language) %}
+      {% set build_relation = target_relation %}
+    {% else %}
+      {% set build_sql = create_table_as(False, target_relation, compiled_code, language, partitioned_by=partitioned_by) %}
+    {% endif %}
   {% elif full_refresh_mode %}
-    {% set build_sql = create_table_as(False, intermediate_relation, compiled_code, language, partitioned_by=partitioned_by) %}
+    {% if sorted_by %}
+      {% set build_sql = create_empty_table_as(False, intermediate_relation, compiled_code, language) %}
+      {% set build_relation = intermediate_relation %}
+    {% else %}
+      {% set build_sql = create_table_as(False, intermediate_relation, compiled_code, language, partitioned_by=partitioned_by) %}
+    {% endif %}
     {% set need_swap = true %}
   {% else %}
+    {% if sorted_by_statement %}
+      {% call statement('ducklake_sorted_by_target') -%}
+        {{ sorted_by_statement }};
+      {%- endcall %}
+    {% endif %}
     {% if language == 'python' %}
       {% set build_python = create_table_as(temporary, temp_relation, compiled_code, language, partitioned_by=none) %}
       {% call statement("pre", language=language) %}
@@ -88,9 +112,29 @@
 
   {% endif %}
 
-  {% call statement("main", language=language, auto_begin=not skip_auto_begin) %}
-      {{- build_sql }}
-  {% endcall %}
+  {% if sorted_by and (existing_relation is none or full_refresh_mode) %}
+    {% call statement("main", language=language) %}
+        {{- build_sql }}
+    {% endcall %}
+    {% if partitioned_by %}
+      {% call statement('ducklake_partitioned_by') -%}
+        {{ duckdb__alter_table_set_partitioned_by(build_relation, partitioned_by) }}
+      {%- endcall %}
+    {% endif %}
+    {% set build_sorted_by_statement = duckdb__get_sorted_by_statement(build_relation, false) %}
+    {% if build_sorted_by_statement %}
+      {% call statement('ducklake_sorted_by_build') -%}
+        {{ build_sorted_by_statement }};
+      {%- endcall %}
+    {% endif %}
+    {% call statement('ducklake_insert', language=language) -%}
+      {{- insert_into_table(build_relation, compiled_code, language) }}
+    {%- endcall %}
+  {% else %}
+    {% call statement("main", language=language, auto_begin=not skip_auto_begin) %}
+        {{- build_sql }}
+    {% endcall %}
+  {% endif %}
 
   {% if need_swap %}
       {#-- Drop indexes on target relation before renaming to backup to avoid dependency errors --#}
@@ -114,6 +158,10 @@
 
   -- `COMMIT` happens here
   {% do adapter.commit() %}
+
+  {% if sorted_by %}
+    {% do ducklake_flush_relation(target_relation) %}
+  {% endif %}
 
   {% for rel in to_drop %}
       {# On MotherDuck the temp relation is a real table; dropping it cascades indexes. Avoid extra ALTERs. #}

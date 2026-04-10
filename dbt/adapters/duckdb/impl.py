@@ -9,6 +9,7 @@ from typing import List
 from typing import Optional
 from typing import Sequence
 from typing import TYPE_CHECKING
+from typing import Union
 from uuid import uuid4
 
 from dbt_common.contracts.constraints import ColumnLevelConstraint
@@ -23,6 +24,7 @@ from packaging.version import Version
 
 from .constants import DEFAULT_TEMP_SCHEMA_NAME
 from .constants import DUCKDB_BASE_INCREMENTAL_STRATEGIES
+from .constants import DUCKLAKE_SORTED_TABLES_LOCAL_MIN_VERSION
 from .constants import DUCKDB_MERGE_LOWEST_VERSION_POSSIBLE
 from .constants import TEMP_SCHEMA_NAME
 from dbt.adapters.base import AdapterConfig
@@ -89,6 +91,7 @@ class DuckDBIndexConfig(dbtClassMixin):
 @dataclass
 class DuckDBConfig(AdapterConfig):
     indexes: Optional[List[DuckDBIndexConfig]] = None
+    sorted_by: Optional[Union[str, List[str]]] = None
 
 
 class DuckDBAdapter(SQLAdapter):
@@ -150,6 +153,86 @@ class DuckDBAdapter(SQLAdapter):
             return False
 
         return relation.database in self.config.credentials._ducklake_dbs
+
+    @available
+    def is_motherduck_relation(self, relation: DuckDBRelation) -> bool:
+        if not relation or not relation.database:
+            return False
+
+        # The adapter can mix local and MotherDuck attachments in one run, so this
+        # needs to be relation-scoped instead of relying on adapter.is_motherduck().
+        return relation.database in getattr(self.config.credentials, "_motherduck_dbs", set())
+
+    @available
+    def ducklake_supports_sorted_by(self, relation: DuckDBRelation) -> bool:
+        if not self.is_ducklake(relation):
+            return False
+
+        if self.is_motherduck_relation(relation):
+            return True
+
+        # Local DuckLake only supports sorted tables from this DuckDB version onward.
+        return self.duckdb_version >= Version(DUCKLAKE_SORTED_TABLES_LOCAL_MIN_VERSION)
+
+    def _normalize_ducklake_table_option_value(self, option_name: str, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            rendered_value = value.strip()
+            if not rendered_value:
+                return None
+            if rendered_value.startswith("(") and rendered_value.endswith(")"):
+                rendered_value = rendered_value[1:-1].strip()
+            return rendered_value or None
+
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            rendered_items = []
+            for item in value:
+                if not isinstance(item, str):
+                    raise DbtRuntimeError(
+                        f"`{option_name}` must be a string or a list of SQL strings"
+                    )
+                stripped_item = item.strip()
+                if not stripped_item:
+                    raise DbtRuntimeError(
+                        f"`{option_name}` list entries must be non-empty SQL strings"
+                    )
+                rendered_items.append(stripped_item)
+
+            if not rendered_items:
+                return None
+
+            return ", ".join(rendered_items)
+
+        raise DbtRuntimeError(f"`{option_name}` must be a string or a list of SQL strings")
+
+    @available
+    def ducklake_order_by_sql(self, value: Any) -> Optional[str]:
+        return self._normalize_ducklake_table_option_value("sorted_by", value)
+
+    @available
+    def ducklake_table_option_sql(self, relation: DuckDBRelation, option_name: str, value: Any) -> str:
+        option_key = option_name.lower()
+        clause_name = {
+            "partitioned_by": "PARTITIONED BY",
+            "sorted_by": "SORTED BY",
+        }.get(option_key)
+
+        if clause_name is None:
+            raise DbtRuntimeError(f"Unsupported DuckLake table option: {option_name}")
+
+        if option_key == "sorted_by" and value is not None and not self.ducklake_supports_sorted_by(relation):
+            raise DbtRuntimeError(
+                f"`sorted_by` requires MotherDuck DuckLake or local DuckDB >= {DUCKLAKE_SORTED_TABLES_LOCAL_MIN_VERSION}. "
+                f"Current local DuckDB version: {self.duckdb_version}."
+            )
+
+        rendered_value = self._normalize_ducklake_table_option_value(option_key, value)
+        if rendered_value is None:
+            return f"alter table {relation} reset {clause_name}"
+
+        return f"alter table {relation} set {clause_name} ({rendered_value})"
 
     @available
     def convert_datetimes_to_strs(self, table: "agate.Table") -> "agate.Table":
